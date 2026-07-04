@@ -1,0 +1,36 @@
+# Build + self-test on every push/PR. Releases are cut by release.yml on tags.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Self-test
+        run: |
+          bin=target/release/mstream-discovery-seed
+          out="$("$bin" --print-id --data-dir selftest-data)"
+          echo "--print-id: $out"
+          echo "$out" | grep -Eq '^[0-9a-f]{64}$' \
+            || { echo "::error::--print-id produced no/invalid output"; exit 1; }
+          # Identity must persist between runs.
+          out2="$("$bin" --print-id --data-dir selftest-data)"
+          [ "$out" = "$out2" ] || { echo "::error::identity did not persist"; exit 1; }
+          # A seed must survive with stdin closed (systemd hands it /dev/null;
+          # exiting on stdin EOF is sidecar behavior a seed must NOT have).
+          "$bin" --data-dir selftest-data < /dev/null > run.log 2>&1 &
+          pid=$!
+          sleep 12
+          kill -0 "$pid" || { echo "::error::seed exited with stdin closed"; cat run.log; exit 1; }
+          grep -q '^ticket: endpoint' run.log || { echo "::error::seed printed no ticket"; cat run.log; exit 1; }
+          kill "$pid"
+          echo "self-test passed"

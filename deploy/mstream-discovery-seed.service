@@ -1,0 +1,26 @@
+# systemd unit for a community seed node.
+#   sudo cp mstream-discovery-seed /usr/local/bin/
+#   sudo useradd --system --home /var/lib/mstream-seed mstream-seed
+#   sudo mkdir -p /var/lib/mstream-seed && sudo chown mstream-seed: /var/lib/mstream-seed
+#   sudo cp deploy/mstream-discovery-seed.service /etc/systemd/system/
+#   sudo systemctl enable --now mstream-discovery-seed
+#   journalctl -u mstream-discovery-seed -f     # watch for "neighbors=N"
+[Unit]
+Description=mStream discovery network seed node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mstream-seed
+ExecStart=/usr/local/bin/mstream-discovery-seed --data-dir /var/lib/mstream-seed
+Restart=on-failure
+RestartSec=10
+# Hardening — the seed needs nothing but the network and its data dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mstream-seed
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

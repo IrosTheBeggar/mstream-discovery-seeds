@@ -1,0 +1,30 @@
+[package]
+name = "mstream-discovery-seed"
+version = "0.1.0"
+edition = "2021"
+description = "Community bootstrap node for the mStream music-discovery network"
+license = "GPL-3.0"
+
+[[bin]]
+name = "mstream-discovery-seed"
+path = "src/main.rs"
+
+[dependencies]
+# ── Cross-repo contract with mStream ─────────────────────────────────────────
+# These pins MUST stay aligned with mStream's p2p-sidecar/Cargo.toml (same
+# exact iroh + iroh-gossip versions) and the catalog topic string in
+# src/main.rs must match p2p-sidecar/src/main.rs — drift makes seeds go
+# quietly deaf. iroh-gossip is pre-1.0 with real wire churn; bump both repos
+# together, deliberately.
+iroh = "=1.0.1"
+iroh-gossip = "=0.101.0"
+iroh-tickets = "=1.0.0"
+# Topic derivation only (blake3 of the topic string — identical bytes to the
+# sidecar's iroh_blobs::Hash::new, without dragging in all of iroh-blobs).
+blake3 = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-stream = "0.1"
+
+[profile.release]
+strip = true
