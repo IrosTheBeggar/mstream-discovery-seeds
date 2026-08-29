@@ -13,8 +13,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # --locked: the lockfile IS the cross-repo contract with the
+      # p2p-sidecar (same iroh/noq resolution, bit for bit) — a silent
+      # re-resolve here would un-validate exactly what CI exists to hold.
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Self-test
         run: |
           bin=target/release/mstream-discovery-seed
