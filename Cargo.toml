@@ -1,6 +1,8 @@
 [package]
 name = "mstream-discovery-seed"
-version = "0.1.0"
+# MAJOR.MINOR mirrors the pinned iroh line, PATCH is this seed's own — the
+# same convention as mstream-p2p-sidecar, adopted at v1.0.0 (iroh 1.0.x).
+version = "1.0.0"
 edition = "2021"
 description = "Community bootstrap node for the mStream music-discovery network"
 license = "GPL-3.0"
@@ -11,13 +13,30 @@ path = "src/main.rs"
 
 [dependencies]
 # ── Cross-repo contract with mStream ─────────────────────────────────────────
-# These pins MUST stay aligned with mStream's p2p-sidecar/Cargo.toml (same
-# exact iroh + iroh-gossip versions) and the catalog topic string in
-# src/main.rs must match p2p-sidecar/src/main.rs — drift makes seeds go
-# quietly deaf. iroh-gossip is pre-1.0 with real wire churn; bump both repos
-# together, deliberately.
-iroh = "=1.0.1"
-iroh-gossip = "=0.101.0"
+# These pins MUST stay aligned with the p2p-sidecar's Cargo.toml (repo
+# IrosTheBeggar/mstream-p2p-sidecar — same exact iroh + iroh-gossip
+# versions) and the catalog topic string in src/main.rs must match its
+# src/main.rs — drift makes seeds go quietly deaf. iroh-gossip is pre-1.0
+# with real wire churn; bump both repos together, deliberately.
+#
+# After bumping iroh, re-pin noq-udp: `cargo update -p noq-udp --precise
+# 1.1.1`. iroh 1.0.3 pulls the noq 1.1.x line, and noq-udp 1.1.0 aborts on
+# the FIRST received datagram under musl (align-4 cmsghdr vs align-8
+# timespec; n0-computer/noq#774). Today's seed builds are glibc-only so it
+# wouldn't bite, but keeping the lockfile aligned with the sidecar's costs
+# nothing and de-mines any future musl build.
+iroh = "=1.0.3"
+# iroh-gossip comes from the mStream FORK, not crates.io — the same tag the
+# p2p-sidecar pins: upstream v0.101.0 plus upstream PR #154 (open,
+# unmerged), without which every superseded or dropped peer link between
+# two live processes leaks a kept-alive QUIC connection (~110 KB each; the
+# leak that OOM-killed long-running sidecars on a ~102-hour fuse, mStream
+# #880). A seed is the WORST-placed node for that leak: it exists to be
+# everyone's first contact, so it churns through more peer links than any
+# other mesh member. Retire the fork and re-pin "=0.101.x" from crates.io
+# the moment an upstream release contains the fix — exact tag, never a
+# branch.
+iroh-gossip = { git = "https://github.com/IrosTheBeggar/iroh-gossip", tag = "v0.101.0-leakfix.1" }
 iroh-tickets = "=1.0.0"
 # Topic derivation only (blake3 of the topic string — identical bytes to the
 # sidecar's iroh_blobs::Hash::new, without dragging in all of iroh-blobs).

@@ -13,8 +13,15 @@ Wants=network-online.target
 [Service]
 User=mstream-seed
 ExecStart=/usr/local/bin/mstream-discovery-seed --data-dir /var/lib/mstream-seed
-Restart=on-failure
+Restart=always
 RestartSec=10
+# Belt against slow leaks: a seed churns through more peer links than any
+# other mesh member (it exists to be everyone's first contact), which is
+# exactly the profile that turned the pre-leakfix iroh-gossip QUIC leak
+# into a droplet-wide OOM elsewhere. Healthy RSS is ~30 MB; at 200 MB the
+# service is killed and Restart=always brings it back in seconds — a
+# bounded blip instead of the kernel OOM killer choosing a victim.
+MemoryMax=200M
 # Hardening — the seed needs nothing but the network and its data dir.
 NoNewPrivileges=true
 ProtectSystem=strict
