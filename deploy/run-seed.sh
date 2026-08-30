@@ -102,7 +102,11 @@ docker logs "$NAME" 2>/dev/null | grep -E '^(endpoint-id|ticket): ' || {
 }
 
 wait_for_neighbor() {
-  for _ in $(seq 1 20); do
+  # 90s: the binary (v1.0.1+) re-dials its bootstrap peers at +30s and +60s
+  # while at zero neighbors — the window must outlast tick #2 so this belt
+  # never races a self-heal that is already landing (it photo-finished one
+  # by 2s at 60s during the v1.0.1 rollout).
+  for _ in $(seq 1 30); do
     if docker logs "$NAME" 2>&1 | grep -q 'neighbor up'; then return 0; fi
     sleep 3
   done
@@ -115,7 +119,7 @@ if [ ${#RUN_ARGS[@]} -gt 0 ]; then
     # v1.0.0's bootstrap dial was one-shot; a lost boot race left the seed
     # waiting passively forever. v1.0.1+ retries on its own — this restart
     # is the belt (and the fix for v1.0.0 binaries).
-    echo "==> no neighbor after 60s — restarting once"
+    echo "==> no neighbor after 90s — restarting once"
     docker restart "$NAME" >/dev/null
     if ! wait_for_neighbor; then
       echo "ERROR: still no neighbor after a retry. The bootstrap peers may be" >&2
