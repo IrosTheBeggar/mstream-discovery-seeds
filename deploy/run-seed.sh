@@ -28,9 +28,10 @@
 #                                        seconds instead of waiting passively
 #                                        to be rediscovered (see README),
 #   4. verifies: prints endpoint-id + ticket, and (when bootstrap tickets
-#      were given) waits for the first neighbor. The bootstrap dial is
-#      currently ONE-SHOT in the binary — a lost boot race means no retry —
-#      so on a miss this script restarts the container once and waits again.
+#      were given) waits for the first neighbor. v1.0.0's bootstrap dial
+#      was ONE-SHOT (a lost boot race meant no retry); v1.0.1+ re-dials
+#      every 30s on its own while at zero neighbors — the restart-once
+#      below stays as a belt and for v1.0.0 binaries.
 #
 # After a FIRST install: copy the printed ticket into mStream's
 # seeds/discovery-seeds.json (see deploy/README.md, "Adding a new seed").
@@ -111,9 +112,10 @@ wait_for_neighbor() {
 if [ ${#RUN_ARGS[@]} -gt 0 ]; then
   echo "==> bootstrap tickets given — waiting for the first neighbor"
   if ! wait_for_neighbor; then
-    # The binary's bootstrap dial is one-shot; a lost boot race leaves the
-    # seed waiting passively forever. One restart = one fresh attempt.
-    echo "==> no neighbor after 60s (one-shot dial likely lost the boot race) — restarting once"
+    # v1.0.0's bootstrap dial was one-shot; a lost boot race left the seed
+    # waiting passively forever. v1.0.1+ retries on its own — this restart
+    # is the belt (and the fix for v1.0.0 binaries).
+    echo "==> no neighbor after 60s — restarting once"
     docker restart "$NAME" >/dev/null
     if ! wait_for_neighbor; then
       echo "ERROR: still no neighbor after a retry. The bootstrap peers may be" >&2
