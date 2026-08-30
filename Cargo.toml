@@ -2,7 +2,7 @@
 name = "mstream-discovery-seed"
 # MAJOR.MINOR mirrors the pinned iroh line, PATCH is this seed's own — the
 # same convention as mstream-p2p-sidecar, adopted at v1.0.0 (iroh 1.0.x).
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Community bootstrap node for the mStream music-discovery network"
 license = "GPL-3.0"

@@ -126,9 +126,9 @@ async fn run(data_dir: PathBuf, bootstrap: Vec<String>) -> Result<()> {
     let topic = TopicId::from_bytes(*blake3::hash(CATALOG_TOPIC).as_bytes());
     // Non-blocking subscribe: the first seed in an empty network must come
     // up alone and simply wait to be everyone else's first contact.
-    let handle = gossip.subscribe(topic, ids).await
+    let handle = gossip.subscribe(topic, ids.clone()).await
         .map_err(|e| anyhow!("gossip subscribe failed: {e}"))?;
-    let (_sender, mut receiver) = handle.split();
+    let (sender, mut receiver) = handle.split();
 
     // Count mesh membership; drain (and ignore) broadcast content — the
     // relay work itself happens inside the gossip actor regardless, but the
@@ -154,6 +154,40 @@ async fn run(data_dir: PathBuf, bootstrap: Vec<String>) -> Result<()> {
             }
         }
     });
+
+    // Bootstrap re-join: the subscribe above fires its join dials exactly
+    // once, and a dial that loses the boot race (the endpoint's network
+    // path not ready yet) was never retried — the seed then waited
+    // passively forever (issue #2; bit the v1.0.0 fleet rollout, where a
+    // restarted seed sat at neighbors=0 until a manual restart gave it a
+    // second attempt). While this seed KNOWS bootstrap peers and has NO
+    // mesh at all, re-issue the join on a slow clock. join_peers is
+    // idempotent (mStream's sidecar leans on that for its own re-joins),
+    // it goes quiet the moment any neighbor exists, and checking
+    // `neighbors == 0` rather than "until first success" also heals any
+    // FUTURE total isolation — a sibling restarting on a calm mesh, not
+    // just our own boot. First check at +30s so a healthy boot dial never
+    // produces a redundant re-join or a noise line.
+    if !ids.is_empty() {
+        let n = neighbors.clone();
+        let sender = sender.clone();
+        let retry_ids = ids.clone();
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut tick = tokio::time::interval_at(start, Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if n.load(Ordering::Relaxed) > 0 {
+                    continue;
+                }
+                eprintln!("[seed] no neighbors — re-dialing {} bootstrap peer(s)", retry_ids.len());
+                if let Err(e) = sender.join_peers(retry_ids.clone()).await {
+                    eprintln!("[seed] bootstrap re-join failed: {e}");
+                }
+            }
+        });
+    }
 
     // Heartbeat for ops (grep the journal for "neighbors="); run until
     // SIGTERM / SIGINT. Deliberately NO stdin interaction of any kind.

@@ -43,9 +43,14 @@ Every flag earned its place:
   what made the gap easy to miss). Give every seed its siblings' tickets and
   a restart re-meshes in seconds instead.
 
-  ⚠ The bootstrap dial is currently **one-shot** (no retry in the binary):
-  if it loses the boot race it silently never tries again. `run-seed.sh`
-  detects the miss and restarts once; do the same if you deploy by hand.
+  ⚠ In v1.0.0 the bootstrap dial was **one-shot** — a lost boot race meant
+  it silently never tried again ([#2]). Since **v1.0.1** the seed re-dials
+  its bootstrap peers every 30 s for as long as it has zero neighbors, so a
+  lost race (or any future total isolation) self-heals without help.
+  `run-seed.sh`'s restart-once check stays as a belt and for v1.0.0
+  binaries.
+
+[#2]: https://github.com/IrosTheBeggar/mstream-discovery-seeds/issues/2
 
 ## Upgrading a seed
 
