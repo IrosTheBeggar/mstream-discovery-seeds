@@ -10,15 +10,20 @@ Footprint: one ~8 MB static-ish binary, ~30 MB RSS, gossip-only bandwidth. Runs 
 
 ## Run one
 
-### Docker
+### Docker (recommended — how the reference fleet runs)
+
+Use [`deploy/run-seed.sh`](deploy/run-seed.sh): it pins the image tag, backs
+up `identity.key` on upgrades, applies the fleet-standard memory cap, wires
+`--bootstrap` tickets so restarts re-mesh in seconds, and verifies the seed
+actually came up meshed:
 
 ```sh
-docker run -d --name mstream-seed \
-  -v mstream-seed-data:/data \
-  --restart unless-stopped \
-  ghcr.io/irosthebeggar/mstream-discovery-seed:latest
+./deploy/run-seed.sh v1.0.0 --bootstrap <an-existing-seed-ticket>
 docker logs mstream-seed        # shows endpoint-id + ticket on boot
 ```
+
+Upgrades, health checks, and the add-a-seed runbook live in
+[`deploy/README.md`](deploy/README.md).
 
 ### Binary + systemd
 
@@ -36,7 +41,7 @@ Grab a binary from [Releases](../../releases) (or `cargo build --release`), then
 
 - **Back up `identity.key`.** It *is* the seed's identity: lose it and every shipped ticket pointing at this seed goes dead. Restoring the file restores the seed, on any host.
 - On boot the seed prints `ticket: endpoint…` on stdout — **that string is what goes into the seed list.**
-- Health: the log prints `neighbors=N` every minute. `neighbors=0` forever on an established network means the seed is unreachable or version-drifted (see contract below).
+- Health: the log prints `neighbors=N` every minute. `neighbors=0` forever on an established network means the seed is unreachable or version-drifted (see contract below) — or, right after a restart with no `--bootstrap` tickets, merely waiting passively to be rediscovered, which can take a long time on a calm mesh. Run seeds with their siblings' tickets (see [`deploy/README.md`](deploy/README.md)) so restarts never wait.
 - Networking: outbound UDP + HTTPS is enough (iroh relays handle inbound behind NAT). A directly reachable UDP port improves things but is not required.
 - Stop with SIGTERM/Ctrl-C. The seed deliberately ignores stdin.
 
@@ -51,4 +56,4 @@ Bump both repos together, deliberately. A topic protocol break moves to `…/v2`
 
 ## Volunteering a seed
 
-Run one as above, then open a PR against the mStream repo adding your `endpointId` + `ticket` to `seeds/discovery-seeds.json`. (Policy for community-run seeds is still being worked out — expect a conversation on the PR.)
+Run one as above (the [add-a-seed runbook](deploy/README.md#adding-a-new-seed) is the full recipe), then open a PR against the mStream repo adding your `endpointId` + `ticket` to `seeds/discovery-seeds.json`. (Policy for community-run seeds is still being worked out — expect a conversation on the PR.)
