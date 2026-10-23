@@ -123,3 +123,14 @@ version-drifted (see the cross-repo contract in the top-level README) — or,
 after a restart with no `--bootstrap`, just lonely: it is still reachable
 and will be woven back in when any peer dials it, but that can take a long
 time on a calm mesh. Bootstrap tickets exist so you never wait on it.
+
+A steady `neighbors=N` with **no** `neighbor up/down` lines for hours is the
+other failure: a wedged gossip actor (2026-10-22 — both fleet seeds, ~20 h,
+zero joins answered). Since v1.4.0 the seed catches that itself: it probes
+the actor once a minute and exits with code 3 after two misses, and the
+`--restart unless-stopped` policy restarts it. Check with:
+
+```sh
+docker logs mstream-seed 2>&1 | grep -E 'actor probe|FATAL|re-subscrib' | tail
+docker inspect --format '{{.RestartCount}} {{.State.StartedAt}}' mstream-seed
+```
