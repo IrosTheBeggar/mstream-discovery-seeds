@@ -30,10 +30,20 @@
 //     that goes into the seed list.
 //   - stdin is deliberately ignored (systemd gives us /dev/null; mStream's
 //     sidecar exits on stdin EOF, a seed must NOT). Stop with SIGTERM/^C.
+//   - LIVENESS (v1.4.0+): the gossip actor is one task; when it stops
+//     turning the seed LOOKS alive — QUIC links up, "neighbors=N" steady —
+//     while it answers no joins at all. The 2026-10-22 outage froze both
+//     community seeds exactly like that for ~20 h (the 0.101.0 blocking
+//     send, see Cargo.toml). Now a dead subscriber is re-created, and an
+//     actor probe (a fresh subscribe must yield the NeighborUp replay
+//     within 20 s; two misses in a row) exits with code 3 so the container
+//     restart policy (deploy/run-seed.sh: --restart unless-stopped) brings
+//     a fresh process. A seed with ZERO neighbors is the re-join loop's
+//     business, not the probe's.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +52,11 @@ use iroh::{
     address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint,
     EndpointId, SecretKey,
 };
-use iroh_gossip::{api::Event, net::Gossip, proto::TopicId};
+use iroh_gossip::{
+    api::{Event, GossipReceiver},
+    net::Gossip,
+    proto::TopicId,
+};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio_stream::StreamExt;
 
@@ -50,6 +64,19 @@ use tokio_stream::StreamExt;
 // iroh_blobs::Hash::new(CATALOG_TOPIC) derivation.
 const CATALOG_TOPIC: &[u8] = b"mstream/discovery/catalog/v1";
 const HEARTBEAT: Duration = Duration::from_secs(60);
+// Gossip liveness (see LIVENESS in the header). Same numbers as the sidecar.
+const ACTOR_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+const ACTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const ACTOR_PROBE_MAX_MISSES: u32 = 2;
+const RESUBSCRIBE_MAX_ATTEMPTS: u32 = 10;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const EXIT_GOSSIP_DEAD: i32 = 3;
+
+type Neighbors = Arc<std::sync::Mutex<HashSet<EndpointId>>>;
+
+fn neighbor_count(neighbors: &Neighbors) -> usize {
+    neighbors.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -128,32 +155,16 @@ async fn run(data_dir: PathBuf, bootstrap: Vec<String>) -> Result<()> {
     // up alone and simply wait to be everyone else's first contact.
     let handle = gossip.subscribe(topic, ids.clone()).await
         .map_err(|e| anyhow!("gossip subscribe failed: {e}"))?;
-    let (sender, mut receiver) = handle.split();
+    let (sender, receiver) = handle.split();
 
-    // Count mesh membership; drain (and ignore) broadcast content — the
-    // relay work itself happens inside the gossip actor regardless, but the
-    // stream must be consumed so it never backs up.
-    let neighbors = Arc::new(AtomicI64::new(0));
-    let n = neighbors.clone();
-    tokio::spawn(async move {
-        while let Some(event) = receiver.next().await {
-            match event {
-                Ok(Event::NeighborUp(id)) => {
-                    n.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[seed] neighbor up: {id}");
-                }
-                Ok(Event::NeighborDown(id)) => {
-                    n.fetch_sub(1, Ordering::Relaxed);
-                    eprintln!("[seed] neighbor down: {id}");
-                }
-                Ok(_) => {} // broadcast content — not ours to read
-                Err(e) => {
-                    eprintln!("[seed] gossip stream error: {e}");
-                    break;
-                }
-            }
-        }
-    });
+    // Live mesh membership, tracked from the subscriber's NeighborUp/Down
+    // events and rebuilt from the actor's replay whenever the subscriber is
+    // re-created. Broadcast content is drained and ignored — the relay work
+    // itself happens inside the gossip actor regardless, but the stream
+    // must be consumed so it never backs up.
+    let neighbors: Neighbors = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    tokio::spawn(subscriber_loop(gossip.clone(), topic, receiver, neighbors.clone()));
+    tokio::spawn(actor_probe_loop(gossip.clone(), topic, neighbors.clone()));
 
     // Bootstrap re-join: the subscribe above fires its join dials exactly
     // once, and a dial that loses the boot race (the endpoint's network
@@ -178,12 +189,20 @@ async fn run(data_dir: PathBuf, bootstrap: Vec<String>) -> Result<()> {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                if n.load(Ordering::Relaxed) > 0 {
+                if neighbor_count(&n) > 0 {
                     continue;
                 }
                 eprintln!("[seed] no neighbors — re-dialing {} bootstrap peer(s)", retry_ids.len());
-                if let Err(e) = sender.join_peers(retry_ids.clone()).await {
-                    eprintln!("[seed] bootstrap re-join failed: {e}");
+                // Bounded: the sender's command channel is finite, so a
+                // wedged actor would otherwise park this loop forever and
+                // hide the wedge (the actor probe is what acts on it).
+                match tokio::time::timeout(COMMAND_TIMEOUT, sender.join_peers(retry_ids.clone())).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!("[seed] bootstrap re-join failed: {e}"),
+                    Err(_) => eprintln!(
+                        "[seed] bootstrap re-join timed out after {}s — the gossip actor is not accepting commands",
+                        COMMAND_TIMEOUT.as_secs()
+                    ),
                 }
             }
         });
@@ -196,16 +215,112 @@ async fn run(data_dir: PathBuf, bootstrap: Vec<String>) -> Result<()> {
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                eprintln!("[seed] neighbors={}", neighbors.load(Ordering::Relaxed).max(0));
+                eprintln!("[seed] neighbors={}", neighbor_count(&neighbors));
             }
             _ = shutdown_signal() => break,
         }
     }
 
     eprintln!("[seed] shutting down");
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = router.shutdown().await;
     endpoint.close().await;
     Ok(())
+}
+
+// Set on SIGTERM/^C: the gossip stream closing is then the shutdown itself,
+// not a dead subscriber to re-create (and not a wedged actor to exit over).
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Drain the subscriber, and outlive it: the gossip API CLOSES a lagged
+// subscriber and never revives a closed stream, while the topic itself
+// stays joined through the GossipSender the re-join loop holds. So when the
+// stream dies, subscribe again — the actor replays NeighborUp for every
+// current neighbor into the fresh receiver, which also rebuilds the live
+// set from scratch.
+async fn subscriber_loop(gossip: Gossip, topic: TopicId, mut receiver: GossipReceiver, neighbors: Neighbors) {
+    loop {
+        let why = loop {
+            match receiver.next().await {
+                Some(Ok(Event::NeighborUp(id))) => {
+                    neighbors.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+                    eprintln!("[seed] neighbor up: {id}");
+                }
+                Some(Ok(Event::NeighborDown(id))) => {
+                    neighbors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    eprintln!("[seed] neighbor down: {id}");
+                }
+                // Don't wait for the close that follows — the stream is dead
+                // either way.
+                Some(Ok(Event::Lagged)) => break "lagged — the actor closed the subscriber".to_string(),
+                Some(Ok(_)) => {} // broadcast content (or a newer event kind) — not ours to read
+                Some(Err(e)) => break format!("stream error: {e}"),
+                None => break "stream closed".to_string(),
+            }
+        };
+        if shutting_down() { return; }
+        eprintln!("[seed] gossip subscriber ended ({why}) — re-subscribing");
+        neighbors.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut attempt = 0u32;
+        receiver = loop {
+            attempt += 1;
+            match tokio::time::timeout(ACTOR_PROBE_TIMEOUT, gossip.subscribe(topic, Vec::new())).await {
+                Ok(Ok(handle)) => break handle.split().1,
+                Ok(Err(e)) => eprintln!("[seed] re-subscribe failed (attempt {attempt}): {e}"),
+                Err(_) => eprintln!("[seed] re-subscribe timed out (attempt {attempt}) — gossip actor unresponsive"),
+            }
+            if attempt >= RESUBSCRIBE_MAX_ATTEMPTS {
+                eprintln!(
+                    "[seed] FATAL: could not re-subscribe to the catalog topic after {attempt} attempts — \
+                     exiting with code {EXIT_GOSSIP_DEAD} for the restart policy"
+                );
+                std::process::exit(EXIT_GOSSIP_DEAD);
+            }
+            tokio::time::sleep(Duration::from_secs(1 << attempt.min(5))).await;
+        };
+    }
+}
+
+// The actor probe (see LIVENESS in the header): a fresh subscriber on a
+// topic with neighbors gets the actor's NeighborUp replay as its first
+// events, so a probe that sees no event in time proves the actor isn't
+// turning. The probe subscriber is dropped right after; the topic stays
+// joined through the other handles.
+async fn actor_probe_loop(gossip: Gossip, topic: TopicId, neighbors: Neighbors) {
+    let mut misses = 0u32;
+    loop {
+        tokio::time::sleep(ACTOR_PROBE_INTERVAL).await;
+        if shutting_down() { return; }
+        if neighbor_count(&neighbors) == 0 {
+            misses = 0;
+            continue;
+        }
+        let probe = async {
+            let handle = gossip.subscribe(topic, Vec::new()).await?;
+            let (_sender, mut rx) = handle.split();
+            rx.next().await.transpose()
+        };
+        let alive = matches!(tokio::time::timeout(ACTOR_PROBE_TIMEOUT, probe).await, Ok(Ok(Some(_))));
+        if alive {
+            misses = 0;
+            continue;
+        }
+        misses += 1;
+        eprintln!(
+            "[seed] gossip actor probe failed ({misses}/{ACTOR_PROBE_MAX_MISSES}): no event within {}s on a fresh subscriber",
+            ACTOR_PROBE_TIMEOUT.as_secs()
+        );
+        if misses >= ACTOR_PROBE_MAX_MISSES {
+            eprintln!(
+                "[seed] FATAL: the gossip actor is wedged — exiting with code {EXIT_GOSSIP_DEAD} for the restart policy"
+            );
+            std::process::exit(EXIT_GOSSIP_DEAD);
+        }
+    }
 }
 
 #[cfg(unix)]
