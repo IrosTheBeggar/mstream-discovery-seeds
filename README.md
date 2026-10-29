@@ -18,7 +18,7 @@ up `identity.key` on upgrades, applies the fleet-standard memory cap, wires
 actually came up meshed:
 
 ```sh
-./deploy/run-seed.sh v1.0.0 --bootstrap <an-existing-seed-ticket>
+./deploy/run-seed.sh v1.5.0 --port 11204 --bootstrap <an-existing-seed-ticket>
 docker logs mstream-seed        # shows endpoint-id + ticket on boot
 ```
 
@@ -35,6 +35,7 @@ Grab a binary from [Releases](../../releases) (or `cargo build --release`), then
 |---|---|
 | `--data-dir <dir>` | required — holds `identity.key` |
 | `--bootstrap <ticket>` | optional, repeatable — mesh with other seeds |
+| `--port <udp-port>` | optional — bind one fixed UDP port (default: random). Publish it so the ticket's direct address survives restarts (v1.5.0+) |
 | `--print-id` | print the endpoint id and exit (used by CI) |
 
 ## Operating notes
@@ -43,7 +44,7 @@ Grab a binary from [Releases](../../releases) (or `cargo build --release`), then
 - On boot the seed prints `ticket: endpoint…` on stdout — **that string is what goes into the seed list.**
 - Health: the log prints `neighbors=N` every minute. `neighbors=0` forever on an established network means the seed is unreachable or version-drifted (see contract below) — or, right after a restart with no `--bootstrap` tickets, merely waiting passively to be rediscovered, which can take a long time on a calm mesh. Run seeds with their siblings' tickets (see [`deploy/README.md`](deploy/README.md)) so restarts never wait.
 - Liveness (v1.4.0+): a seed whose gossip actor stops turning used to look healthy — a steady `neighbors=N` and no `neighbor up/down` churn for hours, while it answered no joins (the 2026-10-22 outage, caused by the iroh-gossip 0.101 blocking send; see `Cargo.toml`). The seed now probes its own actor once a minute and **exits with code 3** after two missed probes, so the container restart policy brings a fresh process; a dead subscriber is re-created in place. In the log: `gossip actor probe failed (1/2)` then `FATAL: the gossip actor is wedged`. A climbing `docker inspect --format '{{.RestartCount}}'` is the signal to look for.
-- Networking: outbound UDP + HTTPS is enough (iroh relays handle inbound behind NAT). A directly reachable UDP port improves things but is not required.
+- Networking: outbound UDP + HTTPS is enough (iroh relays handle inbound behind NAT). A directly reachable UDP port improves things: run with `--port N` and open/publish N so the direct address in your ticket survives restarts (v1.5.0+). With a random port it goes stale on the first restart and peers reach the seed through the relays only.
 - Stop with SIGTERM/Ctrl-C. The seed deliberately ignores stdin.
 
 ## Cross-repo contract with mStream

@@ -3,8 +3,8 @@
 # script behind the reference fleet. Idempotent: safe to re-run, safe for
 # first install and for upgrades alike.
 #
-#   ./run-seed.sh v1.0.0
-#   ./run-seed.sh v1.0.0 --bootstrap <other-seed-ticket> [--bootstrap <…>]
+#   ./run-seed.sh v1.5.0 --port 11204
+#   ./run-seed.sh v1.5.0 --port 11204 --bootstrap <other-seed-ticket> [--bootstrap <…>]
 #
 # What it does, in order:
 #   1. pulls the PINNED image tag (never :latest — an upgrade should be a
@@ -22,6 +22,14 @@
 #                                        grew seeds to ~150 MB on a ~3.7-day
 #                                        fuse and the kernel OOM killer took
 #                                        out fwupd/apt as collateral)
+#        -p N:N/udp + --port N           (with --port, v1.5.0+) ONE fixed UDP
+#                                        port, published 1:1, so the public
+#                                        address inside the printed ticket
+#                                        survives restarts and the shipped
+#                                        seed list stays directly dialable.
+#                                        Without it every restart picks a
+#                                        random port and tickets fall back
+#                                        to relay-only. The fleet uses 11204.
 #        --bootstrap <ticket>…           dial these peers at startup — give
 #                                        every seed its siblings' tickets so
 #                                        a restarted seed re-meshes in
@@ -36,6 +44,8 @@
 # After a FIRST install: copy the printed ticket into mStream's
 # seeds/discovery-seeds.json (see deploy/README.md, "Adding a new seed").
 # After an UPGRADE: the endpoint-id printed at the end must be UNCHANGED.
+# After adding or changing --port: the TICKET changed (new direct address) —
+# re-sign the seed list in mStream (deploy/README.md, "Adding a new seed").
 set -euo pipefail
 
 NAME=mstream-seed
@@ -46,13 +56,20 @@ IMAGE_REPO=ghcr.io/irosthebeggar/mstream-discovery-seed
 TAG="${1:-}"
 case "$TAG" in
   v*) shift ;;
-  *) echo "usage: $0 vX.Y.Z [--bootstrap <ticket>]... [--name NAME] [--volume VOL]" >&2; exit 2 ;;
+  *) echo "usage: $0 vX.Y.Z [--port N] [--bootstrap <ticket>]... [--name NAME] [--volume VOL]" >&2; exit 2 ;;
 esac
 
 RUN_ARGS=()
+PUBLISH=()
+BOOTSTRAPS=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --bootstrap) RUN_ARGS+=(--bootstrap "$2"); shift 2 ;;
+    --bootstrap) RUN_ARGS+=(--bootstrap "$2"); BOOTSTRAPS=$((BOOTSTRAPS + 1)); shift 2 ;;
+    --port)
+      case "${2:-}" in
+        ''|*[!0-9]*) echo "--port needs a UDP port number (got '${2:-}')" >&2; exit 2 ;;
+      esac
+      RUN_ARGS+=(--port "$2"); PUBLISH=(-p "$2:$2/udp"); shift 2 ;;
     --name)      NAME="$2"; shift 2 ;;
     --volume)    VOLUME="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -87,6 +104,7 @@ docker run -d --name "$NAME" \
   -v "$VOLUME":/data \
   --restart unless-stopped \
   --memory "$MEMORY" --memory-swap "$MEMORY" \
+  ${PUBLISH[0]+"${PUBLISH[@]}"} \
   "$IMAGE" ${RUN_ARGS[0]+"${RUN_ARGS[@]}"} >/dev/null
 
 # The seed prints its identity within ~10s (8s bounded relay wait).
@@ -113,7 +131,7 @@ wait_for_neighbor() {
   return 1
 }
 
-if [ ${#RUN_ARGS[@]} -gt 0 ]; then
+if [ "$BOOTSTRAPS" -gt 0 ]; then
   echo "==> bootstrap tickets given — waiting for the first neighbor"
   if ! wait_for_neighbor; then
     # v1.0.0's bootstrap dial was one-shot; a lost boot race left the seed

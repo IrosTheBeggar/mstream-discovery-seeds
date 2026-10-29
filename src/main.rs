@@ -23,6 +23,7 @@
 //   mstream-discovery-seed --data-dir /var/lib/mstream-seed
 //     [--bootstrap <ticket>]...   mesh with other seeds (optional)
 //     [--print-id]                print endpoint id and exit (CI self-test)
+//     [--port <udp-port>]         bind this UDP port (default: a random one)
 //
 //   - identity.key in the data dir IS the seed's identity: back it up.
 //     Lose it and every shipped ticket pointing here goes dead.
@@ -30,6 +31,13 @@
 //     that goes into the seed list.
 //   - stdin is deliberately ignored (systemd gives us /dev/null; mStream's
 //     sidecar exits on stdin EOF, a seed must NOT). Stop with SIGTERM/^C.
+//   - FIXED PORT (v1.5.0+): --port binds ONE UDP port (IPv4 required,
+//     IPv6 best-effort) so the public address inside the printed ticket
+//     survives restarts. The fleet publishes it (deploy/run-seed.sh
+//     --port): shipped tickets then stay directly dialable. Without it
+//     every restart picks a fresh random port, the direct addresses in
+//     seeds/discovery-seeds.json go stale, and bootstrap is relay-only
+//     (how the fleet ran from July to October 2026).
 //   - LIVENESS (v1.4.0+): the gossip actor is one task; when it stops
 //     turning the seed LOOKS alive — QUIC links up, "neighbors=N" steady —
 //     while it answers no joins at all. The 2026-10-22 outage froze both
@@ -42,6 +50,7 @@
 //     business, not the probe's.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -49,8 +58,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use iroh::{
-    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint,
-    EndpointId, SecretKey,
+    address_lookup::memory::MemoryLookup,
+    endpoint::{presets, BindOpts},
+    protocol::Router,
+    Endpoint, EndpointId, SecretKey,
 };
 use iroh_gossip::{
     api::{Event, GossipReceiver},
@@ -83,11 +94,13 @@ fn main() -> Result<()> {
     let mut data_dir: Option<PathBuf> = None;
     let mut bootstrap: Vec<String> = Vec::new();
     let mut print_id_only = false;
+    let mut port: u16 = 0;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--data-dir" => data_dir = Some(PathBuf::from(args.next().context("--data-dir needs a value")?)),
             "--bootstrap" => bootstrap.push(args.next().context("--bootstrap needs a value")?),
             "--print-id" => print_id_only = true,
+            "--port" => port = parse_port(&args.next().context("--port needs a value")?)?,
             other => bail!("unknown argument: {other}"),
         }
     }
@@ -104,18 +117,43 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(data_dir, bootstrap))
+        .block_on(run(data_dir, bootstrap, port))
 }
 
-async fn run(data_dir: PathBuf, bootstrap: Vec<String>) -> Result<()> {
+// 0 = let the OS pick (the pre-v1.5.0 behaviour). Anything else is bound on
+// both address families, see FIXED PORT in the header.
+fn parse_port(s: &str) -> Result<u16> {
+    s.parse::<u16>()
+        .map_err(|_| anyhow!("--port must be a UDP port number 0-65535 (got '{s}')"))
+}
+
+async fn run(data_dir: PathBuf, bootstrap: Vec<String>, port: u16) -> Result<()> {
     let key = load_or_create_identity(&data_dir)?;
     let memory_lookup = MemoryLookup::new();
-    let endpoint = Endpoint::builder(presets::N0)
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(key)
-        .address_lookup(memory_lookup.clone())
+        .address_lookup(memory_lookup.clone());
+    if port != 0 {
+        // IPv4 must bind — a seed nobody can reach over v4 is no seed, and a
+        // port clash is better found at boot than as a silently random port.
+        // IPv6 is best-effort: the fleet's containers have no IPv6, and
+        // iroh's own default `[::]` bind is allowed to fail the same way.
+        builder = builder
+            .bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))
+            .map_err(|e| anyhow!("invalid IPv4 bind address for --port {port}: {e}"))?
+            .bind_addr_with_opts(
+                SocketAddr::from(([0u16; 8], port)),
+                BindOpts::default().set_is_required(false),
+            )
+            .map_err(|e| anyhow!("invalid IPv6 bind address for --port {port}: {e}"))?;
+    }
+    let endpoint = builder
         .bind()
         .await
-        .map_err(|e| anyhow!("endpoint bind failed: {e}"))?;
+        .map_err(|e| anyhow!("endpoint bind failed (--port {port}): {e}"))?;
+    if port != 0 {
+        eprintln!("[seed] bound udp port {port} — publish it so the ticket's direct address stays dialable");
+    }
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
     let router = Router::builder(endpoint.clone())
@@ -359,4 +397,19 @@ fn load_or_create_identity(data_dir: &Path) -> Result<SecretKey> {
     }
     eprintln!("[seed] generated new identity at {} — BACK THIS FILE UP", key_path.display());
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_port;
+
+    #[test]
+    fn port_parses_the_fleet_port_and_rejects_junk() {
+        assert_eq!(parse_port("11204").unwrap(), 11204);
+        assert_eq!(parse_port("0").unwrap(), 0, "0 keeps the random-port default");
+        assert!(parse_port("65536").is_err());
+        assert!(parse_port("-1").is_err());
+        assert!(parse_port("udp").is_err());
+        assert!(parse_port("").is_err());
+    }
 }
